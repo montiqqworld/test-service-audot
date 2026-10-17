@@ -259,3 +259,4 @@ Write-Host "[i] Installed 3rd-Party Services (outside C:\Windows): $($customApps
 if ($customApps.Count -gt 0) {
     $customApps | Format-Table Service, State, StartMode, RunAs, PathName -AutoSize -Wrap
 }
+#df
